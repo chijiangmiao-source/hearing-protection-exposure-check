@@ -1,0 +1,3 @@
+earmuff-api
+*.test
+coverage/

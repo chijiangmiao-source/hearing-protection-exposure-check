@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: ./api
+    image: earmuff-api:latest
+    # 容器内固定监听 8080；宿主机发布端口由 API_PORT 覆盖（默认 8081）。
+    environment:
+      API_PORT: "8080"
+    ports:
+      - "${API_PORT:-8081}:8080"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    image: earmuff-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    # 宿主机访问端口由 WEB_PORT 覆盖（默认 8080）。
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # 一次性验收服务：对真实运行的 api 与 web 做端到端断言，跑完即退出。
+  verify:
+    build:
+      context: ./verify
+    image: earmuff-verify:latest
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      API_BASE: http://api:8080
+      WEB_BASE: http://web
+    restart: "no"
