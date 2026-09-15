@@ -211,8 +211,11 @@ func main() {
 		return rows
 	}
 	comparePayload := func(bAtt []float64) map[string]any {
+		// 每次复制一份 levels：后续 422 用例会原地篡改声级制造越界，
+		// 绝不能让那份异常数据污染共享切片、影响之后的合法对比请求。
+		levels := append([]float64(nil), levelList...)
 		return map[string]any{
-			"levels": levelList,
+			"levels": levels,
 			"candidates": []map[string]any{
 				{"label": "甲", "bands": cmpBands(aAtt)},
 				{"label": "乙", "bands": cmpBands(bAtt)},
