@@ -85,6 +85,15 @@ func combine(cs []float64) float64 {
 	return 10 * math.Log10(sum)
 }
 
+// bandCorrected 逐带计算 C = L − A，供对比端点结果独立复算。
+func bandCorrected(ls, as []float64) []float64 {
+	cs := make([]float64, len(ls))
+	for i := range ls {
+		cs[i] = ls[i] - as[i]
+	}
+	return cs
+}
+
 func main() {
 	fmt.Println("耳罩合成声级：一次性验收（真实 Go API + Vue/nginx 链路）")
 
@@ -186,8 +195,121 @@ func main() {
 	check("无穷值 1e999 返回 422 且定位 level",
 		st == 422 && hasField(errBody, "level"), "status:", st, string(rb))
 
-	// 4) Web 前端容器（nginx）
-	fmt.Println("[4] Vue 前端容器（nginx 托管 + 同源 /api 代理）")
+	// 4) 双候选对比端点：相同衰减 tie；乙衰减全带更大则乙更优；任一候选非法整单 422
+	fmt.Println("[4] POST /api/compare 对比端点")
+	levelList := []float64{90, 92, 95.5, 100, 98, 94}
+	aAtt := []float64{10, 12, 15.5, 20, 18, 14}
+	bAttWorse := []float64{5, 7, 10.5, 15, 13, 9}     // 乙衰减更小 → 佩戴后声级更高
+	bAttBetter := []float64{15, 17, 20.5, 25, 23, 19} // 乙衰减更大 → 乙更优
+
+	cmpBands := func(as []float64) []map[string]any {
+		fs := []int{125, 250, 500, 1000, 2000, 4000}
+		rows := make([]map[string]any, 6)
+		for i := range fs {
+			rows[i] = map[string]any{"frequency": fs[i], "attenuation": as[i]}
+		}
+		return rows
+	}
+	comparePayload := func(bAtt []float64) map[string]any {
+		return map[string]any{
+			"levels": levelList,
+			"candidates": []map[string]any{
+				{"label": "甲", "bands": cmpBands(aAtt)},
+				{"label": "乙", "bands": cmpBands(bAtt)},
+			},
+		}
+	}
+
+	// 4.1 相同衰减 → tie，两份结果完整且未舍入值相等
+	stTie, tieBody, rawTie := postJSON(apiBase+"/api/compare", comparePayload(aAtt))
+	tieOK := stTie == 200 && tieBody["tie"] == true && tieBody["winner"] == ""
+	tieCands, _ := tieBody["candidates"].([]any)
+	if len(tieCands) == 2 {
+		c0 := tieCands[0].(map[string]any)
+		c1 := tieCands[1].(map[string]any)
+		tieOK = tieOK && c0["exactLevel"] == c1["exactLevel"]
+		tieOK = tieOK && len(c0["rows"].([]any)) == 6 && len(c1["rows"].([]any)) == 6
+		if conc, _ := tieBody["conclusion"].(string); !strings.Contains(conc, "相同") {
+			tieOK = false
+		}
+	} else {
+		tieOK = false
+	}
+	check("相同衰减：200、tie=true、两份完整结果且结论为效果相同", tieOK,
+		"status:", stTie, string(rawTie))
+
+	// 4.2 乙衰减更大 → 乙更优；甲衰减更大的反向数据 → 甲更优
+	stWin, winBody, rawWin := postJSON(apiBase+"/api/compare", comparePayload(bAttBetter))
+	winOK := stWin == 200 && winBody["winner"] == "乙" && winBody["tie"] == false
+	if winOK {
+		// 独立复算：乙的未舍入合成声级必须更低
+		csA := combine(bandCorrected(levelList, aAtt))
+		csB := combine(bandCorrected(levelList, bAttBetter))
+		cands := winBody["candidates"].([]any)
+		gotA := cands[0].(map[string]any)["exactLevel"].(float64)
+		gotB := cands[1].(map[string]any)["exactLevel"].(float64)
+		winOK = math.Abs(gotA-csA) < 1e-9 && math.Abs(gotB-csB) < 1e-9 && gotB < gotA
+		// 结论只可能来自服务端且必须点名乙
+		conc, _ := winBody["conclusion"].(string)
+		winOK = winOK && strings.Contains(conc, "乙") && strings.Contains(conc, "更优")
+	}
+	check("乙衰减全带更大：winner=乙，未舍入值与独立复算一致", winOK,
+		"status:", stWin, string(rawWin))
+
+	stOpp, oppBody, rawOpp := postJSON(apiBase+"/api/compare", comparePayload(bAttWorse))
+	oppOK := stOpp == 200 && oppBody["winner"] == "甲"
+	check("反向数据（甲衰减更大）：winner=甲", oppOK, "status:", stOpp, string(rawOpp))
+
+	// 4.3 任一候选缺行/越界/格式错误 → 整单 422，定位含候选标识+频带+字段，且不残留任何候选结果
+	expectCompare422 := func(name string, mutate func(p map[string]any), wantCandidate, wantField string, wantFreq int) {
+		p := comparePayload(aAtt)
+		mutate(p)
+		st, errBody, rb := postJSON(apiBase+"/api/compare", p)
+		ok := st == 422
+		if _, leak := errBody["candidates"]; leak {
+			ok = false
+		}
+		found := false
+		for _, f := range errBody["fields"].([]any) {
+			fm := f.(map[string]any)
+			if fm["field"] != wantField {
+				continue
+			}
+			if wantCandidate != "" && fm["candidate"] != wantCandidate {
+				continue
+			}
+			if wantFreq > 0 {
+				if fr, _ := fm["frequency"].(float64); int(fr) != wantFreq {
+					continue
+				}
+			}
+			found = true
+		}
+		ok = ok && found
+		check(name, ok, "status:", st, "want:", wantCandidate, wantField, wantFreq, string(rb))
+	}
+	expectCompare422("乙缺一行（5 行）", func(p map[string]any) {
+		c := p["candidates"].([]map[string]any)
+		c[1]["bands"] = cmpBands(aAtt)[:5]
+	}, "乙", "bands", 0)
+	expectCompare422("甲 250 Hz 衰减越界", func(p map[string]any) {
+		rows := p["candidates"].([]map[string]any)[0]["bands"].([]map[string]any)
+		rows[1]["attenuation"] = 40.5
+	}, "甲", "attenuation", 250)
+	expectCompare422("乙 1000 Hz 衰减为字符串", func(p map[string]any) {
+		rows := p["candidates"].([]map[string]any)[1]["bands"].([]map[string]any)
+		rows[3]["attenuation"] = "20"
+	}, "乙", "attenuation", 1000)
+	expectCompare422("共用现场声级越界（不归属候选）", func(p map[string]any) {
+		lv := p["levels"].([]float64)
+		lv[0] = 141
+	}, "", "level", 125)
+	expectCompare422("候选标识非法", func(p map[string]any) {
+		p["candidates"].([]map[string]any)[0]["label"] = "丙"
+	}, "", "candidates", 0)
+
+	// 5) Web 前端容器（nginx）
+	fmt.Println("[5] Vue 前端容器（nginx 托管 + 同源 /api 代理）")
 	wresp, err := client.Get(webBase + "/")
 	if err != nil {
 		fmt.Printf("  ✗ 无法连接前端 %s: %v\n", webBase, err)
@@ -207,6 +329,17 @@ func main() {
 	disp2, _ := viaWeb["displayLevel"].(string)
 	check("代理链路与直连 API 结果一致", ok2 && math.Abs(exact2-exact) == 0 && disp2 == display,
 		"direct:", exact, display, "via-web:", exact2, disp2)
+
+	// 对比端点同样经 nginx 代理可用，且与直连结果一致
+	st3, viaWebCmp, rb3 := postJSON(webBase+"/api/compare", comparePayload(bAttBetter))
+	check("经前端 nginx 代理调用 /api/compare 返回 200", st3 == 200, "status:", st3, string(rb3))
+	directCands := winBody["candidates"].([]any)
+	webCands, _ := viaWebCmp["candidates"].([]any)
+	cmpProxyOK := len(webCands) == 2 &&
+		webCands[1].(map[string]any)["exactLevel"] == directCands[1].(map[string]any)["exactLevel"] &&
+		viaWebCmp["winner"] == "乙"
+	check("对比端点代理链路与直连 API 结果一致", cmpProxyOK,
+		"direct winner:", winBody["winner"], "via-web:", viaWebCmp["winner"])
 
 	fmt.Printf("\n验收结果：%d 通过，%d 失败\n", passed, failed)
 	if failed > 0 {

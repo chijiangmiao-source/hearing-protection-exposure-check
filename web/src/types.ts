@@ -19,6 +19,21 @@ export interface CalcRequest {
   bands: BandInput[]
 }
 
+// 两款候选耳罩对比：一组现场声级 + 甲、乙各自的六行逐带衰减。
+export type CandidateLabel = '甲' | '乙'
+
+export interface CompareCandidateInput {
+  label: CandidateLabel
+  /** 候选只提交逐带衰减，现场声级由顶层 levels 复用 */
+  bands: Array<{ frequency: number; attenuation: number | null }>
+}
+
+export interface CompareRequest {
+  /** 六个频带共用的现场声级 L（与单耳罩表单同一组数据） */
+  levels: Array<number | null>
+  candidates: CompareCandidateInput[]
+}
+
 export interface RowOutput {
   frequency: number
   level: number
@@ -37,8 +52,24 @@ export interface CalcResponse {
   displayLevel: string
 }
 
+/** 单个候选耳罩的完整核算结果，字段与 CalcResponse 一致并附带候选标识。 */
+export interface CompareCandidateResult extends CalcResponse {
+  label: CandidateLabel
+}
+
+export interface CompareResponse {
+  candidates: CompareCandidateResult[]
+  /** 较优候选标识 "甲"/"乙"；效果相同时为空串 */
+  winner: '' | CandidateLabel
+  tie: boolean
+  /** 仅由服务端依据未舍入合成声级生成的结论文案，页面原样渲染 */
+  conclusion: string
+}
+
 export interface FieldError {
-  field: 'frequency' | 'level' | 'attenuation' | 'bands'
+  /** 仅对比端点出现：问题所属候选耳罩（甲/乙）；顶层声级错误时省略 */
+  candidate?: CandidateLabel
+  field: 'frequency' | 'level' | 'attenuation' | 'bands' | 'levels' | 'candidates'
   frequency?: number
   message: string
 }
